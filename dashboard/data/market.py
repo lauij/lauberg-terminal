@@ -11,6 +11,34 @@ from dashboard.data import cache
 logger = logging.getLogger(__name__)
 
 
+def _download(ticker: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
+    """Robust wrapper around yf.download that handles MultiIndex columns."""
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=True,
+            timeout=10,
+        )
+        if df.empty:
+            logger.warning(f"yf.download returned empty for {ticker} (period={period})")
+            return pd.DataFrame()
+
+        # yfinance >= 0.2.39 returns MultiIndex columns for single tickers too
+        # e.g. ('Close', 'AAPL') instead of just 'Close'
+        if isinstance(df.columns, pd.MultiIndex):
+            # Drop the ticker level, keep only the price level
+            df.columns = df.columns.get_level_values(0)
+
+        return df
+
+    except Exception as e:
+        logger.error(f"yf.download failed for {ticker}: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
 def get_quote(ticker: str) -> dict:
     """Get current quote for a ticker (price, change, pct change)."""
     cache_key = f"quote:{ticker}"
@@ -19,16 +47,18 @@ def get_quote(ticker: str) -> dict:
         return cached
 
     try:
-        t = yf.Ticker(ticker)
-        # Try 5d first (more reliable than 2d for some tickers)
-        hist = t.history(period="5d")
+        hist = _download(ticker, period="5d", interval="1d")
 
         if hist.empty:
             # Fallback: try 1mo for instruments with sparse data
-            hist = t.history(period="1mo")
+            hist = _download(ticker, period="1mo", interval="1d")
 
         if hist.empty:
-            logger.warning(f"No history data for {ticker}")
+            logger.warning(f"No data available for {ticker}")
+            stale = cache.get(cache_key, ttl=86400)
+            if stale:
+                stale["stale"] = True
+                return stale
             return {"price": None, "change": None, "pct_change": None, "error": True}
 
         current = float(hist["Close"].iloc[-1])
@@ -36,18 +66,24 @@ def get_quote(ticker: str) -> dict:
         change = current - prev
         pct = (change / prev * 100) if prev != 0 else 0
 
+        vol = 0
+        if "Volume" in hist.columns:
+            v = hist["Volume"].iloc[-1]
+            if pd.notna(v) and v > 0:
+                vol = int(v)
+
         result = {
             "price": round(current, 4),
             "change": round(change, 4),
             "pct_change": round(pct, 2),
-            "volume": int(hist["Volume"].iloc[-1]) if "Volume" in hist and hist["Volume"].iloc[-1] > 0 else 0,
+            "volume": vol,
             "error": False,
         }
         cache.put(cache_key, result)
         return result
 
     except Exception as e:
-        logger.warning(f"Failed to fetch quote for {ticker}: {e}")
+        logger.error(f"get_quote failed for {ticker}: {e}", exc_info=True)
         stale = cache.get(cache_key, ttl=86400)
         if stale:
             stale["stale"] = True
@@ -69,8 +105,7 @@ def get_history(
         return df
 
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period=period, interval=interval)
+        df = _download(ticker, period=period, interval=interval)
         if not df.empty:
             serializable = df.reset_index()
             serializable.columns = [str(c) for c in serializable.columns]
@@ -78,7 +113,7 @@ def get_history(
         return df
 
     except Exception as e:
-        logger.warning(f"Failed to fetch history for {ticker}: {e}")
+        logger.error(f"get_history failed for {ticker}: {e}", exc_info=True)
         stale = cache.get(cache_key, ttl=86400)
         if stale:
             df = pd.DataFrame(stale)
@@ -98,7 +133,25 @@ def get_ticker_info(ticker: str) -> dict:
 
     try:
         t = yf.Ticker(ticker)
-        info = t.info
+        info = t.info or {}
+
+        if not info or info.get("trailingPegRatio") is None and info.get("marketCap") is None:
+            logger.warning(f"Ticker.info returned minimal data for {ticker}, trying fast_info")
+            # Fallback: build from fast_info + history
+            try:
+                fi = t.fast_info
+                hist = _download(ticker, period="5d")
+                price = float(hist["Close"].iloc[-1]) if not hist.empty else None
+                info = {
+                    "shortName": ticker,
+                    "marketCap": getattr(fi, "market_cap", None),
+                    "fiftyTwoWeekHigh": getattr(fi, "year_high", None),
+                    "fiftyTwoWeekLow": getattr(fi, "year_low", None),
+                    "currency": getattr(fi, "currency", "USD"),
+                }
+            except Exception:
+                pass
+
         result = {
             "shortName": info.get("shortName", ticker),
             "sector": info.get("sector", "N/A"),
@@ -131,7 +184,7 @@ def get_ticker_info(ticker: str) -> dict:
         return result
 
     except Exception as e:
-        logger.warning(f"Failed to fetch info for {ticker}: {e}")
+        logger.error(f"get_ticker_info failed for {ticker}: {e}", exc_info=True)
         stale = cache.get(cache_key, ttl=86400)
         return stale or {}
 
