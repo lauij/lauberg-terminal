@@ -39,7 +39,7 @@ MARKET_TICKERS = {
     "Brent Crude": "BZ=F",
     "Gold": "GC=F",
     "EUR/USD": "EURUSD=X",
-    "USD/DKK": "DKK=X",
+    "USD/DKK": "USDDKK=X",
     "US 10Y": "^TNX",
 }
 
@@ -72,9 +72,9 @@ TREASURY_MATURITIES = {
 FX_PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "USD/DKK": "DKK=X",
-    "USD/CNY": "CNY=X",
+    "USD/JPY": "USDJPY=X",
+    "USD/DKK": "USDDKK=X",
+    "USD/CNY": "USDCNY=X",
     "EUR/GBP": "EURGBP=X",
 }
 

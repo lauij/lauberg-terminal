@@ -20,14 +20,19 @@ def get_quote(ticker: str) -> dict:
 
     try:
         t = yf.Ticker(ticker)
-        info = t.fast_info
-        hist = t.history(period="2d")
+        # Try 5d first (more reliable than 2d for some tickers)
+        hist = t.history(period="5d")
 
         if hist.empty:
+            # Fallback: try 1mo for instruments with sparse data
+            hist = t.history(period="1mo")
+
+        if hist.empty:
+            logger.warning(f"No history data for {ticker}")
             return {"price": None, "change": None, "pct_change": None, "error": True}
 
-        current = hist["Close"].iloc[-1]
-        prev = hist["Close"].iloc[-2] if len(hist) > 1 else current
+        current = float(hist["Close"].iloc[-1])
+        prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
         change = current - prev
         pct = (change / prev * 100) if prev != 0 else 0
 
@@ -35,7 +40,7 @@ def get_quote(ticker: str) -> dict:
             "price": round(current, 4),
             "change": round(change, 4),
             "pct_change": round(pct, 2),
-            "volume": int(hist["Volume"].iloc[-1]) if "Volume" in hist else 0,
+            "volume": int(hist["Volume"].iloc[-1]) if "Volume" in hist and hist["Volume"].iloc[-1] > 0 else 0,
             "error": False,
         }
         cache.put(cache_key, result)
@@ -140,14 +145,35 @@ def get_news(ticker: str) -> list[dict]:
 
     try:
         t = yf.Ticker(ticker)
-        news = t.news or []
+        raw_news = t.news or []
         items = []
-        for n in news[:15]:
+        for n in raw_news[:15]:
+            # yfinance >= 0.2.36 nests data under "content"
+            content = n.get("content", n)
+            title = content.get("title", n.get("title", ""))
+            publisher = content.get("provider", {})
+            if isinstance(publisher, dict):
+                publisher = publisher.get("displayName", "")
+            else:
+                publisher = n.get("publisher", str(publisher))
+            link = content.get("canonicalUrl", {})
+            if isinstance(link, dict):
+                link = link.get("url", "")
+            else:
+                link = n.get("link", str(link))
+            pub_time = content.get("pubDate", n.get("providerPublishTime", 0))
+            # Convert ISO date string to timestamp if needed
+            if isinstance(pub_time, str):
+                try:
+                    from datetime import datetime as _dt
+                    pub_time = int(_dt.fromisoformat(pub_time.replace("Z", "+00:00")).timestamp())
+                except (ValueError, TypeError):
+                    pub_time = 0
             items.append({
-                "title": n.get("title", ""),
-                "publisher": n.get("publisher", ""),
-                "link": n.get("link", ""),
-                "providerPublishTime": n.get("providerPublishTime", 0),
+                "title": title,
+                "publisher": publisher,
+                "link": link,
+                "providerPublishTime": pub_time,
             })
         cache.put(cache_key, items)
         return items
@@ -162,6 +188,13 @@ def get_multiple_quotes(tickers: dict[str, str]) -> dict[str, dict]:
     """Get quotes for multiple tickers. tickers = {label: symbol}."""
     results = {}
     for label, symbol in tickers.items():
-        results[label] = get_quote(symbol)
-        results[label]["symbol"] = symbol
+        try:
+            results[label] = get_quote(symbol)
+            results[label]["symbol"] = symbol
+        except Exception as e:
+            logger.warning(f"Failed to get quote for {label} ({symbol}): {e}")
+            results[label] = {
+                "symbol": symbol, "price": None, "change": None,
+                "pct_change": None, "error": True,
+            }
     return results
