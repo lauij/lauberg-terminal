@@ -1,7 +1,8 @@
 """Market data fetching via yfinance with SQLite caching.
 
-Uses batched yf.download() calls and a custom requests session with
-proper headers to avoid Yahoo Finance rate limiting (429 errors).
+Uses batched yf.download() calls with rate limiting.
+yfinance >= 1.0 handles its own session via curl_cffi — do NOT pass
+a custom requests.Session or it will error.
 """
 
 import logging
@@ -9,24 +10,13 @@ import time
 from datetime import datetime, timedelta
 
 import pandas as pd
-import requests
 import yfinance as yf
 
 from dashboard.data import cache
 
 logger = logging.getLogger(__name__)
 
-# ─── Custom session to avoid 429s ────────────────────────────────────────────
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-})
-
-# Minimum seconds between Yahoo API calls
+# ─── Rate limiting ───────────────────────────────────────────────────────────
 _RATE_LIMIT_DELAY = 0.5
 _last_call_time = 0.0
 
@@ -43,6 +33,13 @@ def _rate_limit():
 
 # ─── Core download functions ─────────────────────────────────────────────────
 
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns to single level (price fields only)."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
 def _download_single(ticker: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
     """Download data for a single ticker with rate limiting."""
     _rate_limit()
@@ -54,17 +51,12 @@ def _download_single(ticker: str, period: str = "5d", interval: str = "1d") -> p
             progress=False,
             auto_adjust=True,
             timeout=15,
-            session=_session,
         )
         if df.empty:
             logger.warning(f"Empty data for {ticker} (period={period})")
             return pd.DataFrame()
 
-        # yfinance >= 0.2.39 returns MultiIndex columns even for single tickers
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        return df
+        return _flatten_columns(df)
 
     except Exception as e:
         logger.error(f"Download failed for {ticker}: {e}")
@@ -72,7 +64,7 @@ def _download_single(ticker: str, period: str = "5d", interval: str = "1d") -> p
 
 
 def _download_batch(tickers: list[str], period: str = "5d", interval: str = "1d") -> dict[str, pd.DataFrame]:
-    """Download data for multiple tickers in ONE request (much less rate limiting)."""
+    """Download data for multiple tickers in ONE request."""
     if not tickers:
         return {}
 
@@ -87,12 +79,11 @@ def _download_batch(tickers: list[str], period: str = "5d", interval: str = "1d"
             progress=False,
             auto_adjust=True,
             timeout=20,
-            session=_session,
             group_by="ticker",
             threads=False,
         )
     except Exception as e:
-        logger.error(f"Batch download failed for {ticker_str}: {e}")
+        logger.error(f"Batch download failed: {e}")
         return {}
 
     if df.empty:
@@ -101,27 +92,24 @@ def _download_batch(tickers: list[str], period: str = "5d", interval: str = "1d"
 
     results = {}
 
-    # Single ticker: no MultiIndex on columns or grouped differently
     if len(tickers) == 1:
         t = tickers[0]
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        results[t] = df
+        results[t] = _flatten_columns(df)
         return results
 
     # Multiple tickers: columns are MultiIndex (ticker, field)
     if isinstance(df.columns, pd.MultiIndex):
+        level0 = df.columns.get_level_values(0)
         for t in tickers:
             try:
-                ticker_df = df[t].copy() if t in df.columns.get_level_values(0) else pd.DataFrame()
-                if not ticker_df.empty:
+                if t in level0:
+                    ticker_df = df[t].copy()
                     ticker_df = ticker_df.dropna(how="all")
-                if not ticker_df.empty:
-                    results[t] = ticker_df
-            except (KeyError, TypeError):
-                logger.warning(f"Could not extract {t} from batch download")
+                    if not ticker_df.empty:
+                        results[t] = ticker_df
+            except (KeyError, TypeError) as e:
+                logger.warning(f"Could not extract {t} from batch: {e}")
     else:
-        # Fallback: treat as single ticker
         results[tickers[0]] = df
 
     return results
@@ -221,7 +209,7 @@ def get_ticker_info(ticker: str) -> dict:
 
     _rate_limit()
     try:
-        t = yf.Ticker(ticker, session=_session)
+        t = yf.Ticker(ticker)
         info = t.info or {}
 
         result = {
@@ -270,7 +258,7 @@ def get_news(ticker: str) -> list[dict]:
 
     _rate_limit()
     try:
-        t = yf.Ticker(ticker, session=_session)
+        t = yf.Ticker(ticker)
         raw_news = t.news or []
         items = []
         for n in raw_news[:15]:
@@ -311,7 +299,6 @@ def get_news(ticker: str) -> list[dict]:
 
 def get_multiple_quotes(tickers: dict[str, str]) -> dict[str, dict]:
     """Get quotes for multiple tickers in a SINGLE batch request."""
-    # Check cache first
     results = {}
     uncached_labels = {}
     for label, symbol in tickers.items():
@@ -326,7 +313,6 @@ def get_multiple_quotes(tickers: dict[str, str]) -> dict[str, dict]:
     if not uncached_labels:
         return results
 
-    # Batch download all uncached tickers in ONE request
     symbols = list(uncached_labels.values())
     batch_data = _download_batch(symbols, period="5d", interval="1d")
 
