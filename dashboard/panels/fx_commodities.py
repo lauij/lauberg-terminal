@@ -52,13 +52,12 @@ def _build_mini_chart(symbol: str, label: str) -> go.Figure:
             fillcolor=f"rgba({','.join(str(int(color.lstrip('#')[i:i+2], 16)) for i in (0, 2, 4))}, 0.1)",
         ))
 
-    fig.update_layout(
-        **chart_layout("", height=120),
-        margin={"l": 5, "r": 5, "t": 5, "b": 5},
-        xaxis={"visible": False},
-        yaxis={"visible": False},
-        showlegend=False,
-    )
+    base = chart_layout("", height=120)
+    base["margin"] = {"l": 5, "r": 5, "t": 5, "b": 5}
+    base["xaxis"] = {"visible": False}
+    base["yaxis"] = {"visible": False}
+    base["showlegend"] = False
+    fig.update_layout(**base)
     return fig
 
 
