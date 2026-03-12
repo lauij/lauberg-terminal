@@ -1,18 +1,51 @@
-"""Market data fetching via yfinance with SQLite caching."""
+"""Market data fetching via yfinance with SQLite caching.
+
+Uses batched yf.download() calls and a custom requests session with
+proper headers to avoid Yahoo Finance rate limiting (429 errors).
+"""
 
 import logging
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from dashboard.data import cache
 
 logger = logging.getLogger(__name__)
 
+# ─── Custom session to avoid 429s ────────────────────────────────────────────
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+})
 
-def _download(ticker: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
-    """Robust wrapper around yf.download that handles MultiIndex columns."""
+# Minimum seconds between Yahoo API calls
+_RATE_LIMIT_DELAY = 0.5
+_last_call_time = 0.0
+
+
+def _rate_limit():
+    """Simple rate limiter to avoid 429 Too Many Requests."""
+    global _last_call_time
+    now = time.time()
+    elapsed = now - _last_call_time
+    if elapsed < _RATE_LIMIT_DELAY:
+        time.sleep(_RATE_LIMIT_DELAY - elapsed)
+    _last_call_time = time.time()
+
+
+# ─── Core download functions ─────────────────────────────────────────────────
+
+def _download_single(ticker: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
+    """Download data for a single ticker with rate limiting."""
+    _rate_limit()
     try:
         df = yf.download(
             ticker,
@@ -20,24 +53,81 @@ def _download(ticker: str, period: str = "5d", interval: str = "1d") -> pd.DataF
             interval=interval,
             progress=False,
             auto_adjust=True,
-            timeout=10,
+            timeout=15,
+            session=_session,
         )
         if df.empty:
-            logger.warning(f"yf.download returned empty for {ticker} (period={period})")
+            logger.warning(f"Empty data for {ticker} (period={period})")
             return pd.DataFrame()
 
-        # yfinance >= 0.2.39 returns MultiIndex columns for single tickers too
-        # e.g. ('Close', 'AAPL') instead of just 'Close'
+        # yfinance >= 0.2.39 returns MultiIndex columns even for single tickers
         if isinstance(df.columns, pd.MultiIndex):
-            # Drop the ticker level, keep only the price level
             df.columns = df.columns.get_level_values(0)
 
         return df
 
     except Exception as e:
-        logger.error(f"yf.download failed for {ticker}: {e}", exc_info=True)
+        logger.error(f"Download failed for {ticker}: {e}")
         return pd.DataFrame()
 
+
+def _download_batch(tickers: list[str], period: str = "5d", interval: str = "1d") -> dict[str, pd.DataFrame]:
+    """Download data for multiple tickers in ONE request (much less rate limiting)."""
+    if not tickers:
+        return {}
+
+    _rate_limit()
+    ticker_str = " ".join(tickers)
+
+    try:
+        df = yf.download(
+            ticker_str,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=True,
+            timeout=20,
+            session=_session,
+            group_by="ticker",
+            threads=False,
+        )
+    except Exception as e:
+        logger.error(f"Batch download failed for {ticker_str}: {e}")
+        return {}
+
+    if df.empty:
+        logger.warning(f"Batch download returned empty for {ticker_str}")
+        return {}
+
+    results = {}
+
+    # Single ticker: no MultiIndex on columns or grouped differently
+    if len(tickers) == 1:
+        t = tickers[0]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        results[t] = df
+        return results
+
+    # Multiple tickers: columns are MultiIndex (ticker, field)
+    if isinstance(df.columns, pd.MultiIndex):
+        for t in tickers:
+            try:
+                ticker_df = df[t].copy() if t in df.columns.get_level_values(0) else pd.DataFrame()
+                if not ticker_df.empty:
+                    ticker_df = ticker_df.dropna(how="all")
+                if not ticker_df.empty:
+                    results[t] = ticker_df
+            except (KeyError, TypeError):
+                logger.warning(f"Could not extract {t} from batch download")
+    else:
+        # Fallback: treat as single ticker
+        results[tickers[0]] = df
+
+    return results
+
+
+# ─── Public API ──────────────────────────────────────────────────────────────
 
 def get_quote(ticker: str) -> dict:
     """Get current quote for a ticker (price, change, pct change)."""
@@ -47,14 +137,12 @@ def get_quote(ticker: str) -> dict:
         return cached
 
     try:
-        hist = _download(ticker, period="5d", interval="1d")
+        hist = _download_single(ticker, period="5d", interval="1d")
 
         if hist.empty:
-            # Fallback: try 1mo for instruments with sparse data
-            hist = _download(ticker, period="1mo", interval="1d")
+            hist = _download_single(ticker, period="1mo", interval="1d")
 
         if hist.empty:
-            logger.warning(f"No data available for {ticker}")
             stale = cache.get(cache_key, ttl=86400)
             if stale:
                 stale["stale"] = True
@@ -83,7 +171,7 @@ def get_quote(ticker: str) -> dict:
         return result
 
     except Exception as e:
-        logger.error(f"get_quote failed for {ticker}: {e}", exc_info=True)
+        logger.error(f"get_quote failed for {ticker}: {e}")
         stale = cache.get(cache_key, ttl=86400)
         if stale:
             stale["stale"] = True
@@ -105,7 +193,7 @@ def get_history(
         return df
 
     try:
-        df = _download(ticker, period=period, interval=interval)
+        df = _download_single(ticker, period=period, interval=interval)
         if not df.empty:
             serializable = df.reset_index()
             serializable.columns = [str(c) for c in serializable.columns]
@@ -113,7 +201,7 @@ def get_history(
         return df
 
     except Exception as e:
-        logger.error(f"get_history failed for {ticker}: {e}", exc_info=True)
+        logger.error(f"get_history failed for {ticker}: {e}")
         stale = cache.get(cache_key, ttl=86400)
         if stale:
             df = pd.DataFrame(stale)
@@ -131,26 +219,10 @@ def get_ticker_info(ticker: str) -> dict:
     if cached is not None:
         return cached
 
+    _rate_limit()
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=_session)
         info = t.info or {}
-
-        if not info or info.get("trailingPegRatio") is None and info.get("marketCap") is None:
-            logger.warning(f"Ticker.info returned minimal data for {ticker}, trying fast_info")
-            # Fallback: build from fast_info + history
-            try:
-                fi = t.fast_info
-                hist = _download(ticker, period="5d")
-                price = float(hist["Close"].iloc[-1]) if not hist.empty else None
-                info = {
-                    "shortName": ticker,
-                    "marketCap": getattr(fi, "market_cap", None),
-                    "fiftyTwoWeekHigh": getattr(fi, "year_high", None),
-                    "fiftyTwoWeekLow": getattr(fi, "year_low", None),
-                    "currency": getattr(fi, "currency", "USD"),
-                }
-            except Exception:
-                pass
 
         result = {
             "shortName": info.get("shortName", ticker),
@@ -184,7 +256,7 @@ def get_ticker_info(ticker: str) -> dict:
         return result
 
     except Exception as e:
-        logger.error(f"get_ticker_info failed for {ticker}: {e}", exc_info=True)
+        logger.error(f"get_ticker_info failed for {ticker}: {e}")
         stale = cache.get(cache_key, ttl=86400)
         return stale or {}
 
@@ -196,8 +268,9 @@ def get_news(ticker: str) -> list[dict]:
     if cached is not None:
         return cached
 
+    _rate_limit()
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=_session)
         raw_news = t.news or []
         items = []
         for n in raw_news[:15]:
@@ -215,7 +288,6 @@ def get_news(ticker: str) -> list[dict]:
             else:
                 link = n.get("link", str(link))
             pub_time = content.get("pubDate", n.get("providerPublishTime", 0))
-            # Convert ISO date string to timestamp if needed
             if isinstance(pub_time, str):
                 try:
                     from datetime import datetime as _dt
@@ -238,16 +310,64 @@ def get_news(ticker: str) -> list[dict]:
 
 
 def get_multiple_quotes(tickers: dict[str, str]) -> dict[str, dict]:
-    """Get quotes for multiple tickers. tickers = {label: symbol}."""
+    """Get quotes for multiple tickers in a SINGLE batch request."""
+    # Check cache first
     results = {}
+    uncached_labels = {}
     for label, symbol in tickers.items():
-        try:
-            results[label] = get_quote(symbol)
+        cache_key = f"quote:{symbol}"
+        cached = cache.get(cache_key, ttl=60)
+        if cached is not None:
+            results[label] = cached
             results[label]["symbol"] = symbol
+        else:
+            uncached_labels[label] = symbol
+
+    if not uncached_labels:
+        return results
+
+    # Batch download all uncached tickers in ONE request
+    symbols = list(uncached_labels.values())
+    batch_data = _download_batch(symbols, period="5d", interval="1d")
+
+    for label, symbol in uncached_labels.items():
+        try:
+            hist = batch_data.get(symbol, pd.DataFrame())
+
+            if hist.empty:
+                results[label] = {
+                    "symbol": symbol, "price": None, "change": None,
+                    "pct_change": None, "error": True,
+                }
+                continue
+
+            current = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
+            change = current - prev
+            pct = (change / prev * 100) if prev != 0 else 0
+
+            vol = 0
+            if "Volume" in hist.columns:
+                v = hist["Volume"].iloc[-1]
+                if pd.notna(v) and v > 0:
+                    vol = int(v)
+
+            quote = {
+                "price": round(current, 4),
+                "change": round(change, 4),
+                "pct_change": round(pct, 2),
+                "volume": vol,
+                "error": False,
+                "symbol": symbol,
+            }
+            cache.put(f"quote:{symbol}", quote)
+            results[label] = quote
+
         except Exception as e:
-            logger.warning(f"Failed to get quote for {label} ({symbol}): {e}")
+            logger.warning(f"Failed to process {label} ({symbol}): {e}")
             results[label] = {
                 "symbol": symbol, "price": None, "change": None,
                 "pct_change": None, "error": True,
             }
+
     return results
